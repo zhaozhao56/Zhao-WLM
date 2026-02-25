@@ -1,0 +1,185 @@
+# z_world_modules/__init__.py
+# (empty or just for namespace)
+
+# z_world_modules/dissipation_domain.py
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+
+class DissipationDomain(nn.Module):
+    """Single dissipation domain D^n — core state update block"""
+    def __init__(self, dim: int, n: float):
+        super().__init__()
+        self.n = n                      # domain index (for logging / conditional behavior)
+        self.proj = nn.Sequential(
+            nn.Linear(dim, dim * 4),
+            nn.GELU(),
+            nn.Linear(dim * 4, dim)
+        )
+        self.norm = nn.LayerNorm(dim)
+
+    def forward(self,
+                x: torch.Tensor,                # [B, T, D] or [B, D]
+                up_flux: torch.Tensor = None,
+                down_flux: torch.Tensor = None,
+                memory_influence: torch.Tensor = None,
+                crisis_gate: torch.Tensor = None) -> torch.Tensor:
+        dx = self.proj(x)
+
+        if up_flux is not None:
+            dx = dx + up_flux               # Φ↑n — bottom-up emergence
+        if down_flux is not None:
+            dx = dx - down_flux             # Ψ↓n — top-down constraint
+        if memory_influence is not None:
+            dx = dx + memory_influence      # \mathcal{M}^n
+        if crisis_gate is not None:
+            # simple nonlinear crisis injection
+            dx = dx + crisis_gate * torch.tanh(3.0 * dx)
+
+        return self.norm(dx)
+
+
+# z_world_modules/flux_coupling.py
+class FluxCoupling(nn.Module):
+    """Upward & downward flux computation between domains (Φ↑, Ψ↓)"""
+    def __init__(self, domain_dims: list[int], num_heads: int = 8):
+        super().__init__()
+        self.num_domains = len(domain_dims)
+        self.up_attn  = nn.ModuleList([
+            nn.MultiheadAttention(d, num_heads, batch_first=True)
+            for d in domain_dims
+        ])
+        self.down_attn = nn.ModuleList([
+            nn.MultiheadAttention(d, num_heads, batch_first=True)
+            for d in domain_dims
+        ])
+
+    def forward(self, domain_feats: list[torch.Tensor]):
+        # domain_feats = [feat_low, feat_mid, feat_high, ...]   each [B, T, D_i]
+
+        up_fluxes = [None] * self.num_domains
+        down_fluxes = [None] * self.num_domains
+
+        # Upward fluxes (lower → current)
+        for i in range(1, self.num_domains):
+            src = torch.cat(domain_feats[:i], dim=-1)   # concat lower domains
+            tgt = domain_feats[i]
+            out, _ = self.up_attn[i](tgt, src, src)
+            up_fluxes[i] = out.mean(dim=1)              # [B, D_i]
+
+        # Downward fluxes (higher → current)
+        for i in range(self.num_domains-1):
+            src = torch.cat(domain_feats[i+1:], dim=-1)
+            tgt = domain_feats[i]
+            out, _ = self.down_attn[i](tgt, src, src)
+            down_fluxes[i] = out.mean(dim=1)
+
+        return up_fluxes, down_fluxes
+
+
+# z_world_modules/dynamic_memory_kernel.py
+class DynamicMemoryKernel(nn.Module):
+    """Learnable memory convolution kernel K^n(s) with learn/forget/diffusion terms"""
+    def __init__(self, dim: int):
+        super().__init__()
+        self.decay = nn.Parameter(torch.tensor(8.0))          # τ initial
+        self.learn_gate  = nn.Linear(dim, dim)
+        self.forget_gate = nn.Linear(dim, dim)
+        self.diffusion   = nn.Conv1d(dim, dim, kernel_size=5, padding=2, groups=dim)
+
+    def forward(self, current: torch.Tensor, past_seq: torch.Tensor) -> torch.Tensor:
+        # past_seq: [B, T_past, D]
+
+        if past_seq.shape[1] == 0:
+            return torch.zeros_like(current)
+
+        # Exponential decay weights
+        t = torch.arange(past_seq.shape[1], device=past_seq.device).float()
+        weights = torch.exp(-t / self.decay.clamp(min=0.5))
+        weights = weights / (weights.sum() + 1e-8)
+        weights = weights.view(1, -1, 1)                    # [1, T_past, 1]
+
+        # Basic convolution (weighted sum)
+        mem = torch.einsum("bt d,bt->b d", past_seq, weights.squeeze(-1))
+
+        # Learn / forget modulation
+        learn  = torch.sigmoid(self.learn_gate(current))
+        forget = torch.sigmoid(self.forget_gate(current))
+
+        mem = learn * mem - forget * current
+
+        # 1D diffusion term (smooth along time, optional)
+        if mem.ndim == 3:  # [B, T=1, D] → treat as sequence
+            mem = mem.permute(0, 2, 1)                     # [B, D, T]
+            mem = self.diffusion(mem).permute(0, 2, 1)     # back
+            mem = mem.mean(dim=1, keepdim=True)            # collapse
+
+        return mem
+
+
+# z_world_modules/tension_crisis.py
+class TensionCrisisGate(nn.Module):
+    """Computes tension T_ij and crisis gating"""
+    def __init__(self, dim: int):
+        super().__init__()
+        self.proj = nn.Linear(dim * 2, dim)
+        self.t_crit = nn.Parameter(torch.tensor(1.5))
+
+    def forward(self, feat_a: torch.Tensor, feat_b: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+        # Tension scalar proxy
+        diff = torch.norm(feat_a - feat_b, dim=-1, keepdim=True)
+        tension = self.proj(torch.cat([feat_a, feat_b], dim=-1)).abs().mean(dim=-1, keepdim=True)
+        tension = tension * diff / (diff + 1e-6)   # modulate by difference
+
+        gate = (tension > self.t_crit).float()
+        return tension, gate
+
+
+# z_world_modules/silent_eco_agent.py
+class SilentEcoAgent:
+    """Replicator dynamics based silent ecological agent"""
+    def __init__(self, num_agents: int = 8, init_eco_share: float = 0.12):
+        self.num_agents = num_agents
+        self.shares = torch.full((num_agents,), 1.0 / num_agents)
+        self.shares[-1] = init_eco_share           # last = eco
+        self.dt = 0.05
+
+    def compute_fitness(self, metrics: dict) -> torch.Tensor:
+        # metrics example: {'delta_biodiv': 0.1, 'intervention': 0.3, 'intrinsic': 0.8}
+        f_eco = (
+            0.60 * metrics.get('delta_biodiv',   0.0) +
+           -0.80 * metrics.get('intervention',   0.0) +
+            0.40 * metrics.get('intrinsic',      1.0)
+        )
+        f_others = torch.full((self.num_agents-1,), 0.08)
+        return torch.cat([f_others, torch.tensor([f_eco])])
+
+    def update(self, fitness: torch.Tensor) -> float:
+        avg_f = (self.shares * fitness).sum()
+        delta = self.shares * (fitness - avg_f)
+        self.shares += self.dt * delta
+        self.shares.clamp_(0.005, 0.45)
+        self.shares /= self.shares.sum() + 1e-8
+        return self.shares[-1].item()
+
+
+# z_world_modules/value_vector.py
+def compute_value_vector(
+    latent: torch.Tensor,
+    recon: torch.Tensor,
+    past: torch.Tensor,
+    eco_share: float,
+    tension: torch.Tensor,
+    R: torch.Tensor,                # resource vector [energy, attn, bw, comp]
+    lambda_v: float = 0.1
+) -> torch.Tensor:
+    # Very simplified proxies — replace with your exact definitions
+    v_neg     = -F.mse_loss(recon, latent) + 0.05 * (-latent.pow(2).mean().log())   # rough negentropy
+    v_mem     = -F.mse_loss(latent.mean(dim=1), past.mean(dim=1))                   # memory recon
+    v_tension = -torch.relu(tension - 1.5).pow(2).mean()
+    v_res     = -((R - 0.7).clamp(min=0).pow(2)).mean() + 0.1 * R.mean().log()
+    v_quant   = torch.zeros_like(v_neg)                                             # placeholder
+    v_recall  = -F.mse_loss(latent[:, -1], past[:, -1])                             # last frame recall
+
+    V = torch.stack([v_neg, v_mem, v_tension, v_res, v_quant, v_recall])
+    return V
